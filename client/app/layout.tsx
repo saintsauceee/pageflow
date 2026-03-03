@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Pageflow",
-  description: "A cool reading app",
+  description: "Helps you read PDFs with cool tools and features.",
 };
 
 export default function RootLayout({
@@ -13,9 +13,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body
-        className={`antialiased`}
-      >
+      <body className={`$antialiased`}>
         {children}
       </body>
     </html>
