@@ -61,9 +61,19 @@ export default function PDFViewer({ url, name }: PDFViewerProps) {
   // Undo / redo stacks — session-only, not persisted
   const [past,   setPast]   = useState<Highlight[][]>([]);
   const [future, setFuture] = useState<Highlight[][]>([]);
+  const [selectionMenu, setSelectionMenu] = useState<{
+    x: number;
+    y: number;
+    placement: 'above' | 'below';
+    range: Range;
+  } | null>(null);
+  const [menuColor,       setMenuColor]       = useState<HighlightColor>(HIGHLIGHT_COLORS[0]);
+  const [showMenuPalette, setShowMenuPalette] = useState(false);
 
-  const containerRef = useRef<HTMLDivElement>(null);
-  const pickerRef    = useRef<HTMLDivElement>(null);
+  const containerRef      = useRef<HTMLDivElement>(null);
+  const pickerRef         = useRef<HTMLDivElement>(null);
+  const selectionMenuRef  = useRef<HTMLDivElement>(null);
+  const menuColorRef      = useRef<HTMLDivElement>(null);
   const wrapperEls   = useRef<Map<number, HTMLDivElement>>(new Map());
   const stableRefs   = useRef<Map<number, (el: HTMLDivElement | null) => void>>(new Map());
   const intersecting = useRef<Set<number>>(new Set());
@@ -97,6 +107,78 @@ export default function PDFViewer({ url, name }: PDFViewerProps) {
     const id = setTimeout(() => document.addEventListener('click', close), 0);
     return () => { clearTimeout(id); document.removeEventListener('click', close); };
   }, [showColorPicker]);
+
+  // Selection menu — dismiss on outside mousedown
+  useEffect(() => {
+    if (!selectionMenu) return;
+    const dismiss = (e: MouseEvent) => {
+      if (selectionMenuRef.current?.contains(e.target as Node)) return;
+      setSelectionMenu(null);
+    };
+    document.addEventListener('mousedown', dismiss);
+    return () => document.removeEventListener('mousedown', dismiss);
+  }, [selectionMenu]);
+
+  // Selection menu — dismiss on scroll
+  useEffect(() => {
+    if (!selectionMenu || !containerRef.current) return;
+    const el = containerRef.current;
+    const dismiss = () => setSelectionMenu(null);
+    el.addEventListener('scroll', dismiss);
+    return () => el.removeEventListener('scroll', dismiss);
+  }, [selectionMenu]);
+
+  // Selection menu — dismiss when a tool is activated
+  useEffect(() => {
+    if (activeTool !== null) setSelectionMenu(null);
+  }, [activeTool]);
+
+  // Collapse palette whenever the selection menu closes
+  useEffect(() => {
+    if (!selectionMenu) setShowMenuPalette(false);
+  }, [selectionMenu]);
+
+  // Dismiss menu color popover on outside click
+  useEffect(() => {
+    if (!showMenuPalette) return;
+    const dismiss = (e: MouseEvent) => {
+      if (menuColorRef.current?.contains(e.target as Node)) return;
+      setShowMenuPalette(false);
+    };
+    const id = setTimeout(() => document.addEventListener('mousedown', dismiss), 0);
+    return () => { clearTimeout(id); document.removeEventListener('mousedown', dismiss); };
+  }, [showMenuPalette]);
+
+  // Pinch-to-zoom / Ctrl+scroll zoom (non-passive so preventDefault works)
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    let rafId: number | null = null;
+    let pendingFactor = 1;
+
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      // Clamp per-event delta so scroll wheel doesn't jump too far
+      const delta = Math.sign(e.deltaY) * Math.min(Math.abs(e.deltaY), 25);
+      pendingFactor *= Math.exp(-delta / 100);
+      // Batch into one state update per animation frame for smoothness
+      if (rafId === null) {
+        rafId = requestAnimationFrame(() => {
+          setScale((s) => Math.min(4, Math.max(0.25, s * pendingFactor)));
+          pendingFactor = 1;
+          rafId = null;
+        });
+      }
+    };
+
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, []);
 
   // ── History helpers ───────────────────────────────────────────────────────
 
@@ -226,16 +308,80 @@ export default function PDFViewer({ url, name }: PDFViewerProps) {
   // ── Highlight ─────────────────────────────────────────────────────────────
 
   const handleMouseUp = useCallback(() => {
-    if (activeTool !== 'highlight') return;
+    if (activeTool === 'eraser') return;
 
     const selection = window.getSelection();
-    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+
+    if (activeTool === 'highlight') {
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+
+      const range = selection.getRangeAt(0);
+      const clientRects = Array.from(range.getClientRects()).filter(
+        (r) => r.width > 1 && r.height > 1,
+      );
+      if (clientRects.length === 0) return;
+
+      const pageRects = new Map<number, HighlightRect[]>();
+      for (const rect of clientRects) {
+        for (const [pageNum, el] of wrapperEls.current) {
+          const elRect = el.getBoundingClientRect();
+          const centerY = rect.top + rect.height / 2;
+          if (centerY >= elRect.top && centerY <= elRect.bottom) {
+            if (!pageRects.has(pageNum)) pageRects.set(pageNum, []);
+            pageRects.get(pageNum)!.push({
+              top:    rect.top  - elRect.top,
+              left:   rect.left - elRect.left,
+              width:  rect.width,
+              height: rect.height,
+            });
+            break;
+          }
+        }
+      }
+      if (pageRects.size === 0) return;
+
+      const newHighlights: Highlight[] = [...highlights];
+      for (const [pageNum, rects] of pageRects) {
+        newHighlights.push({
+          id: `hl-${Date.now()}-${pageNum}`,
+          pageNum, rects,
+          captureScale: scale,
+          color: activeColor.bg,
+        });
+      }
+      commit(newHighlights);
+      window.getSelection()?.removeAllRanges();
+      return;
+    }
+
+    // activeTool === null: show floating selection menu
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+      setSelectionMenu(null);
+      return;
+    }
 
     const range = selection.getRangeAt(0);
+    const boundingRect = range.getBoundingClientRect();
+    if (boundingRect.width === 0 && boundingRect.height === 0) {
+      setSelectionMenu(null);
+      return;
+    }
+
+    const x = boundingRect.left + boundingRect.width / 2;
+    const placement: 'above' | 'below' = boundingRect.top > 60 ? 'above' : 'below';
+    const y = placement === 'above' ? boundingRect.top - 8 : boundingRect.bottom + 8;
+
+    setSelectionMenu({ x, y, placement, range: range.cloneRange() });
+  }, [activeTool, activeColor, scale, highlights, commit]);
+
+  const applyHighlightFromMenu = useCallback((color: HighlightColor) => {
+    if (!selectionMenu) return;
+
+    const range = selectionMenu.range;
     const clientRects = Array.from(range.getClientRects()).filter(
       (r) => r.width > 1 && r.height > 1,
     );
-    if (clientRects.length === 0) return;
+    if (clientRects.length === 0) { setSelectionMenu(null); return; }
 
     const pageRects = new Map<number, HighlightRect[]>();
     for (const rect of clientRects) {
@@ -254,20 +400,23 @@ export default function PDFViewer({ url, name }: PDFViewerProps) {
         }
       }
     }
-    if (pageRects.size === 0) return;
 
-    const newHighlights: Highlight[] = [...highlights];
-    for (const [pageNum, rects] of pageRects) {
-      newHighlights.push({
-        id: `hl-${Date.now()}-${pageNum}`,
-        pageNum, rects,
-        captureScale: scale,
-        color: activeColor.bg,
-      });
+    if (pageRects.size > 0) {
+      const newHighlights: Highlight[] = [...highlights];
+      for (const [pageNum, rects] of pageRects) {
+        newHighlights.push({
+          id: `hl-${Date.now()}-${pageNum}`,
+          pageNum, rects,
+          captureScale: scale,
+          color: color.bg,
+        });
+      }
+      commit(newHighlights);
     }
-    commit(newHighlights);
+
     window.getSelection()?.removeAllRanges();
-  }, [activeTool, activeColor, scale, highlights, commit]);
+    setSelectionMenu(null);
+  }, [selectionMenu, highlights, scale, commit]);
 
   // ── Eraser ────────────────────────────────────────────────────────────────
 
@@ -397,6 +546,93 @@ export default function PDFViewer({ url, name }: PDFViewerProps) {
             </div>
           </Document>
         </div>
+
+        {/* ── Selection floating menu ───────────────────────────── */}
+        {selectionMenu && (
+          <div
+            ref={selectionMenuRef}
+            className="fixed z-50 flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-[#1c1c28]/95 backdrop-blur-xl border border-white/10 shadow-xl shadow-black/50"
+            style={{
+              left: selectionMenu.x,
+              top:  selectionMenu.y,
+              transform: `translateX(-50%)${selectionMenu.placement === 'above' ? ' translateY(-100%)' : ''}`,
+            }}
+          >
+            <button
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                window.getSelection()?.removeAllRanges();
+                setSelectionMenu(null);
+              }}
+              title="Ask AI"
+              className="flex items-center gap-1 px-2 h-6 rounded-lg text-violet-400 hover:text-violet-300 hover:bg-violet-500/10 transition-all text-[11px] font-medium"
+            >
+              <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/>
+              </svg>
+              Ask
+            </button>
+            <div className="w-px h-4 bg-white/15 mx-0.5" />
+            {/* Color trigger + popover */}
+            <div ref={menuColorRef} className="relative">
+              <button
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setShowMenuPalette((v) => !v)}
+                title="Choose highlight color"
+                className="flex items-center gap-1.5 px-2 h-7 rounded-lg hover:bg-white/8 transition-all"
+              >
+                <span
+                  className="w-4 h-4 rounded-full"
+                  style={{ background: menuColor.dot, boxShadow: `0 0 0 1.5px #1c1c28, 0 0 0 2.5px ${menuColor.dot}` }}
+                />
+                <svg
+                  className="w-2.5 h-2.5 text-white/40"
+                  viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}
+                  strokeLinecap="round" strokeLinejoin="round"
+                  style={{ transform: showMenuPalette ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }}
+                >
+                  <path d="M6 9l6 6 6-6"/>
+                </svg>
+              </button>
+              {showMenuPalette && (
+                <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-2.5 py-2 rounded-xl bg-[#1c1c28]/95 backdrop-blur-xl border border-white/10 shadow-xl shadow-black/50">
+                  {HIGHLIGHT_COLORS.map((color) => (
+                    <button
+                      key={color.id}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => { setMenuColor(color); setShowMenuPalette(false); applyHighlightFromMenu(color); }}
+                      title={`Highlight ${color.id}`}
+                      className="w-5 h-5 rounded-full hover:scale-110 active:scale-95 transition-transform"
+                      style={{
+                        background: color.dot,
+                        boxShadow: menuColor.id === color.id
+                          ? `0 0 0 2px #1c1c28, 0 0 0 3.5px ${color.dot}`
+                          : '0 0 0 1.5px rgba(255,255,255,0.12)',
+                      }}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="w-px h-4 bg-white/15 mx-0.5" />
+            <button
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                const text = selectionMenu.range.toString();
+                if (text) navigator.clipboard.writeText(text);
+                window.getSelection()?.removeAllRanges();
+                setSelectionMenu(null);
+              }}
+              title="Copy"
+              className="w-6 h-6 flex items-center justify-center rounded-lg text-white/50 hover:text-white/90 hover:bg-white/8 transition-all"
+            >
+              <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <rect width="14" height="14" x="8" y="8" rx="2" ry="2"/>
+                <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>
+              </svg>
+            </button>
+          </div>
+        )}
 
         {/* ── Floating toolbar ──────────────────────────────────── */}
         {numPages > 0 && (
